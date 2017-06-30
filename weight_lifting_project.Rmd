@@ -1,0 +1,315 @@
+---
+title: "Machine Learning on Weight Lifting Exercise Dataset"
+author: "kimnewzealand"
+date: "27 June 2017"
+output:
+  html_document:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+  pdf_document: default
+---
+
+## Setup
+
+### Load packages
+
+```{r load-packages, message = FALSE}
+library(ggplot2)
+library(dplyr)
+library(knitr)
+options(digits=3)
+library(caret)
+library(rpart)
+library(randomForest)
+library(parallel)
+library(doParallel)
+```
+
+### Load data
+
+```{r load-data}
+# Load datasets, first checking if the file exists in the working directory.
+setwd("~/MachLearning")
+if (!file.exists("pml-training.csv")) 
+  { download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+  destfile="./pmltraining.csv")
+  }
+if (!file.exists("pml-testing.csv")) 
+  { download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+  destfile="./pmltesting.csv")
+  }
+pmltrain <- read.csv("pmltraining.csv")
+pmltest <- read.csv("pmltesting.csv")
+```
+
+* * *
+## Summary
+
+The goal of this project is to predict the manner in which a participant does the Weight Lifting Exercise; using sensors on the belt, forearm, arm, and dumbbell.
+
+This would be useful to assess and provide feedback to an athlete on how to correct mistakes in during weight lifting exercises. This is and area called qualitative activity recognition.
+
+
+## Part 1: Data
+
+We will first take a look at the data structure of the Weight Lifting Exercise Dataset. 
+The data is sourced from this website: http://groupware.les.inf.puc-rio.br/har,
+and further information from this paper:
+
+_Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013._
+
+
+As per the dataset documentation, 6 male participants aged between 20-28 years were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five ways, the first doing it well, and the other 4 as mistakes:   
+- exactly according to the specification (Class A)  
+- throwing the elbows to the front (Class B)  
+- lifting the dumbbell only halfway (Class C)   
+- lowering the dumbbell only halfway (Class D)   
+- throwing the hips to the front (Class E)  
+
+There were four sensors in each of the users' glove, armband, lumbar belt and
+dumbbell. Four each of these in each sliding window the following were measured:  
+- Euler angles (roll, pitch and yaw)  
+- For each Euler angle: mean, variance, standard deviation, max, min, amplitude, kurtosis and skewness  
+- Raw accelerometer, gyroscope and magnetometer readings  
+
+* * *
+
+## Part 2: Exploratory data analysis
+
+There are `r dim(pmltrain)[1]` observations and `r dim(pmltrain)[2]` variables in the **pmltrain** dataset.
+
+There are `r dim(pmltest)[1]` observations and `r dim(pmltest)[2]` variables in the **pmltest** dataset.
+
+The data has already been divided into training and testing sets, however we would expect a higher ratio instead of the given test set of `r dim(pmltest)[1]` observations. Additionally the **pmltest** does not have the outcome variable _classe- therefore will be used in the final prediction 'test'. 
+
+We will split the **pmltrain** up into testing and training sets for our modelling, after the EDA.
+
+First we will look a the summary statistics and a plot of the outcome variable _classe_ then plots of predictor variables.
+
+```{r}
+# Summary statistics of the categorical outcome variable ie "classe" variable in the training set.
+kable(summary(pmltrain$classe),format="pandoc")
+```
+The _classe_ A appears to be the most frequent of the 5.
+
+```{r}
+# Create a segmented barplot to view the participants frequency against the classe outcomes
+g <- ggplot(pmltrain,aes(user_name))
+g + geom_bar(aes(fill=classe))
+```
+
+  
+The proportions by _username_ and _classe_ appear similar, therefore the participant does not seem to be a factor.
+```{r}
+# Density plot for the total accel for each measure using the featurePlot
+# function in the caret package
+featurePlot(x = pmltrain[,c("total_accel_belt", "total_accel_arm", "total_accel_dumbbell","total_accel_forearm")], 
+            y = pmltrain$classe, 
+            plot = "density",
+            type = c("p", "smooth"),
+            auto.key = list(columns = 5))
+```
+
+The total acceleration arm, belt, dumbbell and forearm curves appear to be bimodal, high peaks bimodal, multimodal and almost normal respectively, where the belt and forearm sensors seem to be noticeable for _classe_ A,  but there are not much differences in the _classe_ for the arm and dumbbell sensors.
+
+Take a further look at the pairs plot for the belt and forearm measurements.
+
+```{r}
+# Pairs plot for the belt measurement 
+featurePlot(x = pmltrain[, 8:11], 
+            y = pmltrain$classe, 
+            plot = "ellipse",
+            auto.key = list(columns = 5))
+
+# Pairs plot for the forearm measurement 
+featurePlot(x = pmltrain[, 63:65], 
+            y = pmltrain$classe, 
+            plot = "ellipse",
+            auto.key = list(columns = 5))
+
+```
+  
+There are distinct groupings or clusters by _classe_ for belt measurements, and the yaw and the roll may influence the total acceleration and classe. The clustering does not seem as apparent for the forearm.
+
+
+
+* * *
+
+## Part 4: Modeling
+
+For our modeling we will be using the R package caret.
+
+**DATA SPLITTING**
+```{r}
+# Use the caret package to split the pmltrain2 into training and testing sets
+inTrain <- createDataPartition(pmltrain$classe,p=0.6,list=FALSE)
+training <- pmltrain[inTrain,]
+testing <- pmltrain[-inTrain,]
+```
+
+**PREPROCESSING**
+
+1. First we will filter out the predictor variables that are not useful.
+
+```{r removevariables}
+# Since we are only predicting accelerometer readings, remove the gyroscope and # magnetometer readings, using the dplyr package
+# Remove the user_name, raw dates and X as these are identifier variables and do # not have predictive value,
+# we will also remove the mean, variance, standard deviation, max, min, 
+# amplitude, kurtosis and skewness calculated variables and keep the underlying # variables.
+
+training <- training %>% 
+  dplyr::select(-starts_with("user_name")) %>% 
+  dplyr::select(-starts_with("X")) %>% 
+  dplyr::select(-starts_with("raw"))  %>%
+  dplyr::select(-starts_with("cvtd")) %>%
+  dplyr::select(-starts_with("gyros")) %>%   
+  dplyr::select(-starts_with("magnet")) %>% 
+  dplyr::select(-starts_with("mean")) %>% 
+  dplyr::select(-starts_with("min")) %>% 
+  dplyr::select(-starts_with("max")) %>% 
+  dplyr::select(-starts_with("skewness")) %>% 
+  dplyr::select(-starts_with("kurtosis")) %>% 
+  dplyr::select(-starts_with("amplitude")) %>% 
+  dplyr::select(-starts_with("var")) %>% 
+  dplyr::select(-starts_with("stddev")) %>%
+  dplyr::select(-starts_with("avg"))
+
+testing <- testing %>%  
+  dplyr::select(-starts_with("user_name")) %>% 
+  dplyr::select(-starts_with("X")) %>% 
+  dplyr::select(-starts_with("raw"))  %>%
+  dplyr::select(-starts_with("cvtd")) %>%
+  dplyr::select(-starts_with("gyros")) %>%   
+  dplyr::select(-starts_with("magnet")) %>% 
+  dplyr::select(-starts_with("mean")) %>% 
+  dplyr::select(-starts_with("min")) %>% 
+  dplyr::select(-starts_with("max")) %>% 
+  dplyr::select(-starts_with("skewness")) %>% 
+  dplyr::select(-starts_with("kurtosis")) %>% 
+  dplyr::select(-starts_with("amplitude")) %>% 
+  dplyr::select(-starts_with("var")) %>% 
+  dplyr::select(-starts_with("stddev")) %>%
+  dplyr::select(-starts_with("avg"))
+```
+
+2. Remove near zero variances
+```{r}
+# Look for near zero variance covariates to eliminate from dataset
+nsv <- nearZeroVar(training,saveMetrics = TRUE)
+kable(nsv[nsv$nzv==TRUE,])
+
+training <- training %>%  
+  dplyr::select(-starts_with("new_window"))
+
+# Apply to the test set too
+testing <- testing %>%  
+  dplyr::select(-starts_with("new_window"))
+```
+We have also removed the following variables from the testing: new_window
+
+2. Convert integer variables to numeric, to work in the modeling functions
+```{r}
+# Convert integer variables to numeric in train set
+training$num_window <- as.numeric(training$num_window)
+training$total_accel_belt <- as.numeric(training$total_accel_arm)
+training$total_accel_arm <- as.numeric(training$total_accel_arm)
+training$total_accel_dumbbell <- as.numeric(training$total_accel_arm)
+training$total_accel_forearm <- as.numeric(training$total_accel_arm)
+# Convert integer variables to numeric in test set
+testing$num_window <- as.numeric(testing$num_window)
+testing$total_accel_belt <- as.numeric(testing$total_accel_arm)
+testing$total_accel_arm <- as.numeric(testing$total_accel_arm)
+testing$total_accel_dumbbell <- as.numeric(testing$total_accel_arm)
+testing$total_accel_forearm <- as.numeric(testing$total_accel_arm)
+```
+
+3. Find the highly correlated variables
+```{r}
+# ID highly correlated predictors with cutoff 0.75,leaving out the outcome variable
+descrCor <-  abs(cor(training[ ,2:18]))
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .75)
+kable(training[0,highlyCorDescr])
+```
+  
+We may want to consider reducing these highly correlated predictors.
+
+4. PreProcess with caret
+
+```{r}
+# preProcess center and scaled, and ignored.
+preProc <- preProcess(training,method=c('center','scale'))
+# Print out the preprocessed dataframe results
+preProc
+```
+We may want to consider this preprocessing in our modeling. 
+
+
+
+
+Since the remaining factors are numerical other than the outcome variable, _classe_, we do not need to create dummy variables. Additionally no imputation is required as there are no remaining missing values.
+
+**MODEL TRAINING**
+
+Since we know the outcome categorical variable, we will use supervised machine learning classification algorithms. It also appears from our EDA that we will need a non-linear model.  The algorithms that we will use are classification trees, and random forest which uses bootstrapping.
+
+After filtering out sparse variables there are still 52 input variables to work with. Random forests are particularly well suited to handle a large number of inputs, especially when the interactions between variables are unknown.
+
+We have reduced the number of variables from `r dim(pmltrain)[2]-1` to `r dim(training)[2]-1` through preprocessing. We will also look into further dimension reduction in our modeling.
+
+We will select the final model based on the highest accuracy measure.
+
+** TREE CLASSIFICATION**
+
+```{r}
+# Create a model using tree classification using caret train function
+modtree <- suppressMessages(train(classe~.,training,method="rpart"))
+```  
+
+The accuracy for the tree classification is `r confusionMatrix(testing$classe,predict(modtree,testing))$overall['Accuracy']`
+
+**RANDOM FOREST**
+
+```{r}
+# Create a model using random forest using caret train function
+set.seed(123)
+# Configure parallel processings as recommended
+# https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+cluster <- makeCluster(detectCores() - 1) # Convention to leave 1 core for OS
+registerDoParallel(cluster)
+# Create trainControl object for k fold cross validation
+control <- trainControl(method = "cv",
+                           number = 10,
+                           allowParallel = TRUE)
+modforest <- train(classe~.,training,method="rf",trControl=control)
+# Deregister parallel processing
+stopCluster(cluster)
+registerDoSEQ()
+```  
+Based on this random forest model, estimate variable importance.
+```{r}
+# Ploy estimate variable  importance using caret varImp function
+varimp <- varImp(modforest)
+plot(varimp, main = "Variable Importance of Top 20 variables", top = 20)
+```
+
+The accuracy for the random forest is `r confusionMatrix(testing$classe,predict(modforest,testing))$overall['Accuracy']`.
+
+Out of sample error or out of bag (OOB) error is 1-accuracy ie `r 1- confusionMatrix(testing$classe,predict(modforest,testing))$overall['Accuracy']`.
+* * *
+
+## Part 5: Prediction
+
+Predict the _classe_ variable in the **pmltest** dataset using final model _modforest_:
+```{r}
+kable(predict(modforest,pmltest))
+```
+* * *
+
+## Part 6: Conclusion
+
+We developed a decision tree and random forest training model on the split training set from **pmltest** and ran a prediction on the created testing set using the random forest model. 
+
+The exploratory data analysis indicated that the belt related variables could be predictors in the model, which we also saw in the variable importance plot.
+
+Based on the estimated accuracy, we can conclude that very few test samples will be miss-classified using the random forest model.
